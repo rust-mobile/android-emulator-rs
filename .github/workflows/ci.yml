@@ -1,0 +1,191 @@
+name: CI
+
+on: [pull_request, push]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Check code formatting.
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+      - name: Install rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt
+          profile: minimal
+          override: true
+      - name: Run rustfmt
+        uses: actions-rs/cargo@v1
+        with:
+          command: fmt
+          args: --all -- --check
+
+  # Static analyzer.
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+      - name: Install rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy
+          profile: minimal
+          override: true
+      - name: Run clippy
+        uses: actions-rs/clippy-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          args: --all --tests -- -D warnings
+
+  # Security audit.
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Generate Lockfile
+        run: cargo generate-lockfile
+
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Check that codegen is up to date.
+  codegen:
+    name: Check codegen
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+
+      - name: Install rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Install protoc
+        run: |
+          curl -LO "https://github.com/protocolbuffers/protobuf/releases/download/v33.1/protoc-33.1-linux-x86_64.zip"
+          unzip protoc-33.1-linux-x86_64.zip -d protoc
+          sudo mv protoc/bin/protoc /usr/local/bin/
+          sudo mv protoc/include/* /usr/local/include/
+
+      - name: Run codegen
+        run: cargo xtask codegen
+
+      - name: Check for changes
+        run: |
+          if ! git diff --exit-code; then
+            echo "::error::Generated code is out of date. Please run 'cargo xtask codegen' and commit the changes."
+            exit 1
+          fi
+
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        #os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Enable KVM group perms
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      # There's no point caching while we don't save any snapshots
+      #- name: Cache AVD
+      #  uses: actions/cache@v4
+      #  id: avd-cache
+      #  with:
+      #    path: |
+      #      ~/.android/avd/*
+      #      ~/.android/adb*
+      #    key: ${{ runner.os }}-android-avd-36
+
+      - name: Cache Android SDK
+        uses: actions/cache@v4
+        id: sdk-cache
+        with:
+          path: |
+            /usr/local/lib/android/sdk/system-images/*
+            /usr/local/lib/android/sdk/emulator
+          key: ${{ runner.os }}-android-sdk-36
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Install Android SDK packages
+        run: |
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --list_installed
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "emulator" "system-images;android-36;google_apis;x86_64"
+
+      # NOTE: There's something about XDG_CONFIG_HOME being in the github runner environment that
+      # makes the avdmanager write the AVDs to ~/.config/.android/avd/ instead of ~/.android/avd/,
+      # and the emulator doesn't find them.
+      # We work around this by unsetting XDG_CONFIG_HOME.
+      - name: Create AVD
+        run: |
+          unset XDG_CONFIG_HOME
+          echo "no" | $ANDROID_HOME/cmdline-tools/latest/bin/avdmanager create avd -n test -k "system-images;android-36;google_apis;x86_64" --force
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Run tests
+        run: cargo test --verbose -- --nocapture
+
+      - name: Build examples
+        run: cargo build --examples --verbose
+
+      - name: Run screenshot example
+        timeout-minutes: 5
+        run: cargo run --release --example screenshot
+
+      - name: Upload Screenshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-screenshot
+          path: screenshot.png
+          retention-days: 30

@@ -1,0 +1,37 @@
+[package]
+name = "android-emulator"
+description = "A Rust library for spawning or discovering Android Emulators and controlling them via the gRPC controller protocol."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rust-mobile/android-emulator-rs"
+documentation = "https://docs.rs/android-emulator"
+readme = "README.md"
+version = "0.1.0"
+edition = "2024"
+include = ["/README.md", "/LICENSE*", "/src/**", "/proto/**", "/examples/**"]
+
+[dependencies]
+tracing = "0.1"
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+tokio = { version = "1", features = ["fs", "time"] }
+thiserror = "2"
+dirs = "5"
+adb_client = "3.1"
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+rand_core = "0.6"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+serial_test = "3"
+tokio = { version = "1", features = [
+    "rt",
+    "rt-multi-thread",
+    "time",
+    "macros",
+] }
+test-log = { version = "0.2", features = ["trace"] }
