@@ -181,7 +181,7 @@ jobs:
 
       - name: Run screenshot example
         timeout-minutes: 5
-        run: cargo run --release --example screenshot
+        run: cargo run --example screenshot
 
       - name: Upload Screenshot
         uses: actions/upload-artifact@v4
