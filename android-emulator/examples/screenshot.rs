@@ -11,6 +11,8 @@ use android_emulator::{EmulatorConfig, list_avds, list_emulators};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
+
     println!("Android Emulator Screenshot Example\n");
 
     let emulators = list_emulators().await?;
@@ -111,12 +113,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(filename, &screenshot.image)?;
     println!("\nScreenshot saved to: {}", filename);
 
-    // Clean up: terminate emulator if we started it
+    // Clean up: kill emulator if we started it
     if instance.is_owned() {
-        println!("\nTerminating emulator we started...");
-        instance.terminate().await?;
+        println!("\nKilling emulator we started...");
+        instance.kill().await?;
     } else {
-        println!("\nNot terminating emulator since we did not start it");
+        println!("\nNot killing emulator since we did not start it");
     }
 
     Ok(())

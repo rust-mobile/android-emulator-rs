@@ -15,6 +15,8 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
+
     let avds = list_avds().await?;
     if avds.is_empty() {
         eprintln!(
@@ -46,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(e) => {
             eprintln!("Error: {}", e);
-            instance.terminate().await?;
+            instance.kill().await?;
             return Ok(());
         }
     };
@@ -118,6 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Touch released");
 
     println!("\nWaiting for emulator to fully boot...");
+
     let elapsed = client
         .wait_until_booted(std::time::Duration::from_secs(260), None)
         .await?;
@@ -127,8 +130,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  uptime: {} ms", status.uptime);
     println!("  booted: {:?}", status.booted);
 
-    println!("\nTerminating emulator...");
-    instance.terminate().await?;
+    println!("\nInitiating graceful shutdown...");
+    client.shutdown(None).await?;
 
+    println!("VM shutdown complete, killing process...");
+    instance.kill().await?;
+
+    println!("Emulator shutdown complete");
     Ok(())
 }
