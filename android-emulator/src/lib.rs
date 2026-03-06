@@ -24,6 +24,14 @@ use crate::auth::AuthProvider;
 #[cfg(doctest)]
 pub struct ReadmeDoctests;
 
+const EMULATOR_BIN: &str = const {
+    if cfg!(windows) {
+        "emulator.exe"
+    } else {
+        "emulator"
+    }
+};
+
 #[derive(Error, Debug)]
 pub enum EmulatorError {
     #[error(
@@ -485,7 +493,7 @@ impl EmulatorConfig {
     /// Start an Android emulator with the given configuration
     pub async fn spawn(self) -> Result<Emulator> {
         let android_home = get_android_home().await?;
-        let emulator_path = android_home.join("emulator").join("emulator");
+        let emulator_path = android_home.join("emulator").join(EMULATOR_BIN);
 
         if !tokio::fs::try_exists(&emulator_path).await.unwrap_or(false) {
             return Err(EmulatorError::EmulatorToolNotFound(
@@ -1244,7 +1252,7 @@ pub async fn list_avds() -> Result<Vec<String>> {
     let android_home = get_android_home().await?;
 
     tokio::task::spawn_blocking(move || {
-        let emulator_path = android_home.join("emulator").join("emulator");
+        let emulator_path = android_home.join("emulator").join(EMULATOR_BIN);
 
         if !emulator_path.exists() {
             return Err(EmulatorError::EmulatorToolNotFound(
