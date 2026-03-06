@@ -3,6 +3,8 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+
     println!("Looking for running emulators...");
     let emulators = list_emulators().await?;
 
