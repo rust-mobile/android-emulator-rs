@@ -19,6 +19,9 @@ pub mod proto;
 #[cfg(windows)]
 mod windows;
 
+#[cfg(unix)]
+mod unix;
+
 pub use proto::emulator_controller_client::EmulatorControllerClient;
 use tonic::transport::Channel;
 
@@ -615,12 +618,16 @@ impl EmulatorConfig {
 
         // On Windows, use a dedicated Job Object per emulator to ensure that when we
         // kill the emulator, all child processes (like qemu) are also terminated.
-        // On other platforms, just spawn normally.
+        // On Unix, use a process group for the same purpose.
         #[cfg(windows)]
         let (job, mut process) = crate::windows::EmulatorJob::spawn(cmd)
             .map_err(|e| EmulatorError::EmulatorStartFailed(e.to_string()))?;
 
-        #[cfg(not(windows))]
+        #[cfg(unix)]
+        let (process_group, mut process) = crate::unix::EmulatorProcessGroup::spawn(cmd)
+            .map_err(|e| EmulatorError::EmulatorStartFailed(e.to_string()))?;
+
+        #[cfg(not(any(windows, unix)))]
         let mut process = cmd
             .spawn()
             .map_err(|e| EmulatorError::EmulatorStartFailed(e.to_string()))?;
@@ -721,6 +728,8 @@ impl EmulatorConfig {
             process,
             #[cfg(windows)]
             job: Some(job),
+            #[cfg(unix)]
+            process_group: Some(process_group),
             stdout_task,
             stderr_task,
             shutdown_tx: Some(shutdown_tx),
@@ -1081,6 +1090,9 @@ struct OwnedProcess {
     /// Windows Job Object for killing the entire process tree (emulator.exe + qemu)
     #[cfg(windows)]
     job: Option<crate::windows::EmulatorJob>,
+    /// Unix process group for killing the entire process tree (emulator + qemu)
+    #[cfg(unix)]
+    process_group: Option<crate::unix::EmulatorProcessGroup>,
     /// IO forwarding task for stdout (None if stdout was redirected)
     stdout_task: Option<JoinHandle<io::Result<()>>>,
     /// IO forwarding task for stderr (None if stderr was redirected)
@@ -1119,8 +1131,26 @@ async fn kill_owned_process(mut owned_process: OwnedProcess) -> Result<()> {
         }
     }
 
-    // On non-Windows platforms, just kill the child directly
-    #[cfg(not(windows))]
+    // On Unix, use the process group to kill the entire process tree
+    // This ensures that child processes like qemu are also terminated
+    #[cfg(unix)]
+    {
+        if let Some(process_group) = &owned_process.process_group {
+            if let Err(err) = process_group.kill() {
+                tracing::error!("Failed to kill emulator process group: {}", err);
+                return Err(EmulatorError::EmulatorKillFailed(err.to_string()));
+            }
+        } else {
+            // Fallback if no process group (shouldn't happen for owned processes)
+            if let Err(err) = owned_process.process.start_kill() {
+                tracing::error!("Failed to kill emulator process: {}", err);
+                return Err(EmulatorError::EmulatorKillFailed(err.to_string()));
+            }
+        }
+    }
+
+    // On other platforms, just kill the child directly
+    #[cfg(not(any(windows, unix)))]
     if let Err(err) = owned_process.process.start_kill() {
         tracing::error!("Failed to kill emulator process: {}", err);
         return Err(EmulatorError::EmulatorKillFailed(err.to_string()));
