@@ -3,17 +3,24 @@
 //! This library provides Rust bindings for controlling Android Emulators via gRPC,
 //! along with utilities for starting and managing emulator instances.
 
-use std::io::{self, BufRead};
+use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use thiserror::Error;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
 
 pub mod auth;
 pub mod proto;
+
+#[cfg(windows)]
+mod windows;
+
+#[cfg(unix)]
+mod unix;
 
 pub use proto::emulator_controller_client::EmulatorControllerClient;
 use tonic::transport::Channel;
@@ -23,6 +30,14 @@ use crate::auth::AuthProvider;
 #[doc = include_str!("../README.md")]
 #[cfg(doctest)]
 pub struct ReadmeDoctests;
+
+const EMULATOR_BIN: &str = const {
+    if cfg!(windows) {
+        "emulator.exe"
+    } else {
+        "emulator"
+    }
+};
 
 #[derive(Error, Debug)]
 pub enum EmulatorError {
@@ -48,6 +63,9 @@ pub enum EmulatorError {
 
     #[error("Failed to start emulator: {0}")]
     EmulatorStartFailed(String),
+
+    #[error("Failed to kill emulator: {0}")]
+    EmulatorKillFailed(String),
 
     #[error("Emulator connection timed out")]
     ConnectionTimeout,
@@ -179,9 +197,9 @@ pub struct EmulatorConfig {
     /// If None, a default allowlist will be generated
     grpc_allowlist: Option<auth::GrpcAllowlist>,
     /// Stdout redirect configuration
-    stdout: Option<Stdio>,
+    stdout: Option<std::process::Stdio>,
     /// Stderr redirect configuration
-    stderr: Option<Stdio>,
+    stderr: Option<std::process::Stdio>,
 }
 
 impl EmulatorConfig {
@@ -471,13 +489,13 @@ impl EmulatorConfig {
     }
 
     /// Configure stdout for the emulator process
-    pub fn stdout<T: Into<Stdio>>(mut self, cfg: T) -> Self {
+    pub fn stdout<T: Into<std::process::Stdio>>(mut self, cfg: T) -> Self {
         self.stdout = Some(cfg.into());
         self
     }
 
     /// Configure stderr for the emulator process
-    pub fn stderr<T: Into<Stdio>>(mut self, cfg: T) -> Self {
+    pub fn stderr<T: Into<std::process::Stdio>>(mut self, cfg: T) -> Self {
         self.stderr = Some(cfg.into());
         self
     }
@@ -485,7 +503,7 @@ impl EmulatorConfig {
     /// Start an Android emulator with the given configuration
     pub async fn spawn(self) -> Result<Emulator> {
         let android_home = get_android_home().await?;
-        let emulator_path = android_home.join("emulator").join("emulator");
+        let emulator_path = android_home.join("emulator").join(EMULATOR_BIN);
 
         if !tokio::fs::try_exists(&emulator_path).await.unwrap_or(false) {
             return Err(EmulatorError::EmulatorToolNotFound(
@@ -529,19 +547,21 @@ impl EmulatorConfig {
         let use_default_stdout = self.stdout.is_none();
         let use_default_stderr = self.stderr.is_none();
 
-        // Configure stdout (default to piped and run thread to forward to std::io so test capturing works)
+        // Configure stdout (default to piped and run task to forward output)
         if let Some(stdout) = self.stdout {
             cmd.stdout(stdout);
         } else {
             cmd.stdout(std::process::Stdio::piped());
         }
 
-        // Configure stderr (default to piped and run thread to forward to std::io so test capturing works)
+        // Configure stderr (default to piped and run task to forward output)
         if let Some(stderr) = self.stderr {
             cmd.stderr(stderr);
         } else {
             cmd.stderr(std::process::Stdio::piped());
         }
+
+        cmd.stdin(std::process::Stdio::null());
 
         // Configure gRPC based on authentication mode
         // All modes start with -grpc <port>
@@ -596,40 +616,107 @@ impl EmulatorConfig {
             cmd.arg(arg);
         }
 
+        // On Windows, use a dedicated Job Object per emulator to ensure that when we
+        // kill the emulator, all child processes (like qemu) are also terminated.
+        // On Unix, use a process group for the same purpose.
+        #[cfg(windows)]
+        let (job, mut process) = crate::windows::EmulatorJob::spawn(cmd)
+            .map_err(|e| EmulatorError::EmulatorStartFailed(e.to_string()))?;
+
+        #[cfg(unix)]
+        let (process_group, mut process) = crate::unix::EmulatorProcessGroup::spawn(cmd)
+            .map_err(|e| EmulatorError::EmulatorStartFailed(e.to_string()))?;
+
+        #[cfg(not(any(windows, unix)))]
         let mut process = cmd
             .spawn()
             .map_err(|e| EmulatorError::EmulatorStartFailed(e.to_string()))?;
 
-        // Create IO forwarding thread for stdout if piped (default behavior)
-        let stdout_thread = if use_default_stdout {
-            let child_out = process.stdout.take().expect("stdout should be piped");
+        // Create shutdown channel for IO forwarding tasks
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-            Some(thread::spawn(move || -> io::Result<()> {
-                let _span = tracing::info_span!("emulator").entered();
-                let reader = io::BufReader::new(child_out);
-                for line in reader.lines() {
-                    let line = line?;
-                    log_emulator_line(&line);
+        // Create IO forwarding task for stdout if piped (default behavior)
+        let stdout_task = if use_default_stdout {
+            let child_out = process.stdout.take().expect("stdout should be piped");
+            let mut shutdown_rx = shutdown_rx.clone();
+
+            let handle = tokio::spawn(async move {
+                tracing::info!("Stdout forwarding task started");
+                let reader = BufReader::new(child_out);
+                let mut lines = reader.lines();
+
+                loop {
+                    tokio::select! {
+                        res = shutdown_rx.wait_for(|v| *v) => {
+                            match res {
+                                Ok(_) => tracing::info!("Stdout forwarding task received shutdown signal"),
+                                Err(_) => tracing::info!("Stdout forwarding task: shutdown sender dropped"),
+                            }
+                            break;
+                        }
+                        result = lines.next_line() => {
+                            match result {
+                                Ok(Some(line)) => log_emulator_line(&line),
+                                Ok(None) => {
+                                    tracing::debug!("Stdout EOF reached");
+                                    break;
+                                }
+                                Err(e) => {
+                                    tracing::error!("Error reading stdout: {}", e);
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    }
                 }
+
+                tracing::info!("Stdout forwarding task exiting");
                 Ok(())
-            }))
+            });
+            Some(handle)
         } else {
             None
         };
 
-        // Create IO forwarding thread for stderr if piped (default behavior)
-        let stderr_thread = if use_default_stderr {
-            let child_err = process.stderr.take().expect("stderr should be piped");
+        // Create IO forwarding task for stderr if piped (default behavior)
+        let stderr_task = if use_default_stderr {
+            let child_stderr = process.stderr.take().expect("stderr should be piped");
+            let mut shutdown_rx = shutdown_rx.clone();
 
-            Some(thread::spawn(move || -> io::Result<()> {
-                let _span = tracing::info_span!("emulator").entered();
-                let reader = io::BufReader::new(child_err);
-                for line in reader.lines() {
-                    let line = line?;
-                    log_emulator_line(&line);
+            let handle = tokio::spawn(async move {
+                tracing::info!("Stderr forwarding task started");
+                let reader = BufReader::new(child_stderr);
+                let mut lines = reader.lines();
+
+                loop {
+                    tokio::select! {
+                        res = shutdown_rx.wait_for(|v| *v) => {
+                            match res {
+                                Ok(_) => tracing::info!("Stderr forwarding task received shutdown signal"),
+                                Err(_) => tracing::info!("Stderr forwarding task: shutdown sender dropped"),
+                            }
+                            break;
+                        }
+                        result = lines.next_line() => {
+                            match result {
+                                Ok(Some(line)) => log_emulator_line(&line),
+                                Ok(None) => {
+                                    tracing::debug!("Stderr EOF reached");
+                                    break;
+                                }
+                                Err(e) => {
+                                    tracing::error!("Error reading stderr: {}", e);
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    }
                 }
+
+                tracing::info!("Stderr forwarding task exiting");
                 Ok(())
-            }))
+            });
+            Some(handle)
         } else {
             None
         };
@@ -637,16 +724,24 @@ impl EmulatorConfig {
         // Poll ADB until the emulator appears and we can read its metadata
         let (serial, metadata, discovery_path) = Self::poll_for_emulator(grpc_port).await?;
 
+        let owned_process = OwnedProcess {
+            process,
+            #[cfg(windows)]
+            job: Some(job),
+            #[cfg(unix)]
+            process_group: Some(process_group),
+            stdout_task,
+            stderr_task,
+            shutdown_tx: Some(shutdown_tx),
+        };
+
         Ok(Emulator {
-            is_owned: true,
-            process: tokio::sync::Mutex::new(Some(process)),
+            owned_process: Some(tokio::sync::Mutex::new(Some(owned_process))),
             grpc_port,
             serial,
             metadata,
             discovery_path,
             issuer,
-            stdout_thread: tokio::sync::Mutex::new(stdout_thread),
-            stderr_thread: tokio::sync::Mutex::new(stderr_thread),
         })
     }
 }
@@ -840,6 +935,295 @@ impl EmulatorClient {
             tokio::time::sleep(sleep_duration).await;
         }
     }
+
+    /// Request a graceful shutdown of the emulator via the gRPC protocol
+    ///
+    /// This method requests a graceful shutdown by setting the VM state to
+    /// `SHUTDOWN` and polls the VM state until it reaches a terminal state or
+    /// the timeout is reached.
+    ///
+    /// This is a protocol-level operation that does not explicitly kill the
+    /// emulator process, but a successful shutdown will typically result in the
+    /// emulator process exiting on its own.
+    ///
+    /// If you spawned the emulator then explicitly calling
+    /// `Emulator::kill()` or dropping the `Emulator` after a shutdown
+    /// request will kill the process if it hasn't already exited cleanly.
+    ///
+    /// This is the preferred way to stop an emulator as it allows the guest OS
+    /// to shut down cleanly, save snapshots, and perform proper cleanup.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Maximum duration to wait for the VM to shut down (defaults
+    ///   to 30 seconds if None)
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if the shutdown request was successful and the VM shut
+    /// down, or an error if the operation fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Setting the VM state fails
+    /// - The shutdown timeout is exceeded
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use android_emulator::{EmulatorConfig, EmulatorClient};
+    /// use std::time::Duration;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = EmulatorConfig::new("test");
+    /// let instance = config.spawn().await?;
+    /// let mut client = instance.connect(Some(Duration::from_secs(30)), true).await?;
+    ///
+    /// // ... use the emulator ...
+    ///
+    /// // Gracefully shutdown via protocol
+    /// client.shutdown(None).await?;
+    ///
+    /// // Clean up the process if we spawned it
+    /// instance.kill().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn shutdown(&mut self, timeout: Option<Duration>) -> Result<()> {
+        use crate::proto::{VmRunState, vm_run_state::RunState};
+
+        let timeout = timeout.unwrap_or(Duration::from_secs(30));
+        let poll_interval = Duration::from_millis(500);
+
+        tracing::info!("Requesting graceful emulator shutdown...");
+
+        // Request shutdown
+        let shutdown_state = VmRunState {
+            state: RunState::Shutdown as i32,
+        };
+
+        self.protocol_mut()
+            .set_vm_state(shutdown_state)
+            .await
+            .map_err(|e| {
+                EmulatorError::EmulatorKillFailed(format!(
+                    "Failed to set VM state to SHUTDOWN: {}",
+                    e
+                ))
+            })?;
+
+        tracing::info!("Shutdown request sent, waiting for VM to shut down...");
+
+        // Poll VM state until shutdown completes or timeout
+        let start = std::time::Instant::now();
+        let mut last_state = None;
+
+        loop {
+            match self.protocol_mut().get_vm_state(()).await {
+                Ok(response) => {
+                    let vm_state = response.into_inner();
+                    let state = RunState::try_from(vm_state.state).unwrap_or(RunState::Unknown);
+
+                    if last_state != Some(state) {
+                        tracing::debug!("VM state: {:?}", state);
+                        last_state = Some(state);
+                    }
+
+                    // Check if we've reached a terminal state (or if the connection failed,
+                    // which likely means the VM has shut down)
+                    match state {
+                        RunState::Unknown => {
+                            // Unknown state might indicate the emulator is shutting down
+                            tracing::info!("VM entered unknown state, proceeding with termination");
+                            break;
+                        }
+                        _ => {
+                            // Continue polling
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Connection error likely means the emulator has shut down
+                    tracing::info!(
+                        "Lost connection to emulator ({}), assuming shutdown complete",
+                        e
+                    );
+                    break;
+                }
+            }
+
+            // Check timeout
+            if start.elapsed() >= timeout {
+                tracing::warn!(
+                    "Shutdown timeout reached after {:.1} seconds, forcing termination",
+                    timeout.as_secs_f64()
+                );
+                break;
+            }
+
+            // Calculate remaining time and sleep
+            let remaining = timeout.saturating_sub(start.elapsed());
+            let sleep_duration = poll_interval.min(remaining);
+
+            if sleep_duration.is_zero() {
+                break;
+            }
+
+            tokio::time::sleep(sleep_duration).await;
+        }
+
+        tracing::info!("VM shutdown complete");
+        Ok(())
+    }
+}
+
+/// Process state for an emulator instance that was spawned by this crate
+///
+/// This encapsulates all the state needed to manage a process we own,
+/// including the process handle itself, any IO forwarding tasks, and
+/// the shutdown channel to coordinate their termination.
+#[derive(Debug)]
+struct OwnedProcess {
+    /// The spawned child process
+    process: Child,
+    /// Windows Job Object for killing the entire process tree (emulator.exe + qemu)
+    #[cfg(windows)]
+    job: Option<crate::windows::EmulatorJob>,
+    /// Unix process group for killing the entire process tree (emulator + qemu)
+    #[cfg(unix)]
+    process_group: Option<crate::unix::EmulatorProcessGroup>,
+    /// IO forwarding task for stdout (None if stdout was redirected)
+    stdout_task: Option<JoinHandle<io::Result<()>>>,
+    /// IO forwarding task for stderr (None if stderr was redirected)
+    stderr_task: Option<JoinHandle<io::Result<()>>>,
+    /// Shutdown channel sender for IO forwarding tasks (None if no IO tasks)
+    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+}
+
+/// Kill an owned process and clean up its resources
+///
+/// This is used by both `Emulator::kill()` and `Emulator::drop()` to ensure
+/// consistent cleanup behavior.
+async fn kill_owned_process(mut owned_process: OwnedProcess) -> Result<()> {
+    let pid = owned_process.process.id();
+
+    // Kill the process (this will cause EOF on stdout/stderr pipes)
+    if let Some(pid) = pid {
+        tracing::info!("Terminating emulator process with PID {}", pid);
+    }
+
+    // On Windows, use the job object to kill the entire process tree
+    // This ensures that child processes like qemu are also terminated
+    #[cfg(windows)]
+    {
+        if let Some(job) = &owned_process.job {
+            if let Err(err) = job.kill() {
+                tracing::error!("Failed to kill emulator job: {}", err);
+                return Err(EmulatorError::EmulatorKillFailed(err.to_string()));
+            }
+        } else {
+            // Fallback if no job (shouldn't happen for owned processes)
+            if let Err(err) = owned_process.process.start_kill() {
+                tracing::error!("Failed to kill emulator process: {}", err);
+                return Err(EmulatorError::EmulatorKillFailed(err.to_string()));
+            }
+        }
+    }
+
+    // On Unix, use the process group to kill the entire process tree
+    // This ensures that child processes like qemu are also terminated
+    #[cfg(unix)]
+    {
+        if let Some(process_group) = &owned_process.process_group {
+            if let Err(err) = process_group.kill() {
+                tracing::error!("Failed to kill emulator process group: {}", err);
+                return Err(EmulatorError::EmulatorKillFailed(err.to_string()));
+            }
+        } else {
+            // Fallback if no process group (shouldn't happen for owned processes)
+            if let Err(err) = owned_process.process.start_kill() {
+                tracing::error!("Failed to kill emulator process: {}", err);
+                return Err(EmulatorError::EmulatorKillFailed(err.to_string()));
+            }
+        }
+    }
+
+    // On other platforms, just kill the child directly
+    #[cfg(not(any(windows, unix)))]
+    if let Err(err) = owned_process.process.start_kill() {
+        tracing::error!("Failed to kill emulator process: {}", err);
+        return Err(EmulatorError::EmulatorKillFailed(err.to_string()));
+    }
+
+    // We first signal to kill the emulator and wait for it to exit
+    // before shutting down the IO tasks to ensure the emulator doesn't
+    // get blocked trying to write to a synchronous pipe with no reader.
+
+    // Wait for the process to exit (we already called start_kill or job.kill above)
+    let wait_res = match owned_process.process.wait().await {
+        Ok(status) => {
+            if let Some(pid) = pid {
+                tracing::info!(
+                    "Emulator process with PID {} has exited with status: {:?}",
+                    pid,
+                    status
+                );
+            }
+            Ok(())
+        }
+        Err(err) => {
+            tracing::error!("Failed to wait for emulator process to exit: {}", err);
+            Err(EmulatorError::EmulatorKillFailed(err.to_string()))
+        }
+    };
+
+    // Send shutdown signal to IO forwarding tasks
+    if let Some(tx) = &owned_process.shutdown_tx {
+        tracing::info!("Sending shutdown signal to IO forwarding tasks");
+        let _ = tx.send(true);
+    }
+
+    // Join the IO tasks if they exist
+    if let Some(stdout_task) = owned_process.stdout_task.take() {
+        tracing::info!("Joining stdout forwarding task...");
+        match stdout_task.await {
+            Ok(Ok(())) => {
+                tracing::info!("Stdout forwarding task completed successfully")
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Stdout forwarding task completed with error: {}", e)
+            }
+            Err(e) => {
+                if e.is_cancelled() {
+                    tracing::debug!("Stdout forwarding task was cancelled");
+                } else {
+                    tracing::error!("Failed to join stdout forwarding task: {}", e);
+                }
+            }
+        }
+    }
+
+    if let Some(stderr_task) = owned_process.stderr_task.take() {
+        tracing::info!("Joining stderr forwarding task...");
+        match stderr_task.await {
+            Ok(Ok(())) => {
+                tracing::info!("Stderr forwarding task completed successfully")
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Stderr forwarding task completed with error: {}", e)
+            }
+            Err(e) => {
+                if e.is_cancelled() {
+                    tracing::debug!("Stderr forwarding task was cancelled");
+                } else {
+                    tracing::error!("Failed to join stderr forwarding task: {}", e);
+                }
+            }
+        }
+    }
+
+    wait_res
 }
 
 /// Handle to a running emulator instance
@@ -848,8 +1232,11 @@ impl EmulatorClient {
 /// already-running emulator we discovered with [`list_emulators`].
 #[derive(Debug)]
 pub struct Emulator {
-    is_owned: bool,
-    process: tokio::sync::Mutex<Option<Child>>,
+    /// Process state if this emulator was spawned by this crate
+    /// - `None` for discovered emulators (not owned)
+    /// - `Some(Mutex(Some(_)))` for owned emulators with live process
+    /// - `Some(Mutex(None))` for owned emulators where process has been killed
+    owned_process: Option<tokio::sync::Mutex<Option<OwnedProcess>>>,
     serial: String,
     grpc_port: u16,
     /// Path to the discovery .ini file
@@ -858,10 +1245,6 @@ pub struct Emulator {
     metadata: std::collections::HashMap<String, String>,
     /// Issuer identifier for JWT authentication (if spawned with custom issuer)
     issuer: Option<String>,
-    /// IO forwarding thread for stdout (when piped)
-    stdout_thread: tokio::sync::Mutex<Option<JoinHandle<io::Result<()>>>>,
-    /// IO forwarding thread for stderr (when piped)
-    stderr_thread: tokio::sync::Mutex<Option<JoinHandle<io::Result<()>>>>,
 }
 
 impl Emulator {
@@ -872,7 +1255,7 @@ impl Emulator {
 
     /// Check if this instance represents an emulator we spawned
     pub fn is_owned(&self) -> bool {
-        self.is_owned
+        self.owned_process.is_some()
     }
 
     pub fn discovery_path(&self) -> &Path {
@@ -1080,21 +1463,44 @@ impl Emulator {
 
         let jwks_dir = PathBuf::from(jwks_path);
 
-        let issuer = self.issuer.as_deref().unwrap_or("android-studio");
+        let issuer = self
+            .issuer
+            .as_deref()
+            .unwrap_or("android-studio")
+            .to_string();
 
         // Generate and register key
-        let provider = auth::JwtTokenProvider::new_and_register(&jwks_dir, issuer)?;
+        let jwt_provider = tokio::task::spawn_blocking(
+            move || -> std::result::Result<_, crate::auth::AuthError> {
+                tracing::info!(
+                    "Generating and registering JWT token provider with issuer '{}'",
+                    issuer
+                );
+                let provider = auth::JwtTokenProvider::new_and_register(&jwks_dir, issuer)?;
 
-        // Wait for activation (30 second timeout)
-        provider.wait_for_activation(&jwks_dir, Duration::from_secs(10))?;
+                tracing::info!("JWT token provider registered, waiting for activation...");
+                // Wait for activation (30 second timeout)
+                provider.wait_for_activation(&jwks_dir, Duration::from_secs(10))?;
 
-        let provider = AuthProvider::new_with_token_provider(provider);
+                let provider = AuthProvider::new_with_token_provider(provider);
+
+                Ok(provider)
+            },
+        )
+        .await
+        .map_err(|err| {
+            EmulatorError::EmulatorStartFailed(format!(
+                "Failure running task to register JWT token provider: {err}"
+            ))
+        })??;
 
         let start = std::time::Instant::now();
 
         loop {
             tracing::info!("Attempting JWT connection...");
-            match EmulatorClient::connect_with_auth(self.grpc_endpoint(), provider.clone()).await {
+            match EmulatorClient::connect_with_auth(self.grpc_endpoint(), jwt_provider.clone())
+                .await
+            {
                 Ok(mut client) => {
                     tracing::info!("JWT authentication successful.");
                     // Try a simple call to verify the JWT connection works
@@ -1129,7 +1535,7 @@ impl Emulator {
         }
     }
 
-    /// Terminate the emulator process and wait for it to fully exit
+    /// Kill the emulator process and wait for it to fully exit
     ///
     /// If this instance owns the process (spawned via `spawn()`), this will kill the process
     /// and wait for it to exit.
@@ -1137,27 +1543,25 @@ impl Emulator {
     /// If this instance was discovered via `find()`, this returns an error as we don't own
     /// the process.
     ///
-    /// To terminate a discovered emulator, use ADB commands directly.
-    pub async fn terminate(&self) -> Result<()> {
-        let mut lock = self.process.lock().await;
-        if let Some(mut process) = lock.take() {
-            return tokio::task::spawn_blocking(move || {
-                // Kill the process
-                process.kill()?;
+    /// To kill a discovered emulator, use ADB commands directly.
+    pub async fn kill(&self) -> Result<()> {
+        // Check if this emulator is owned
+        let Some(mutex) = &self.owned_process else {
+            tracing::warn!("kill() called on an emulator that is not owned by this instance");
+            return Ok(());
+        };
 
-                // Wait for the process to fully exit
-                let _ = process.wait()?;
+        // Take ownership of the process state
+        let owned = mutex.lock().await.take();
 
-                Ok(())
-            })
-            .await
-            .map_err(|e| EmulatorError::EmulatorStartFailed(format!("Task join error: {}", e)))?;
+        if let Some(owned_process) = owned {
+            kill_owned_process(owned_process).await?;
+            tracing::info!("Emulator killed successfully");
+            Ok(())
+        } else {
+            tracing::warn!("kill() called but process was already killed");
+            Ok(())
         }
-
-        // TODO: send a shutdown command via gRPC instead and wait for it to exit
-        Err(EmulatorError::EmulatorStartFailed(
-            "Cannot terminate emulator: process not owned by this instance".to_string(),
-        ))
     }
 }
 
@@ -1165,16 +1569,17 @@ impl Drop for Emulator {
     fn drop(&mut self) {
         // We have exclusive ownership (&mut self), so we can use get_mut() directly
         // without needing to lock, which avoids panics in async contexts
-        if let Some(ref mut process) = *self.process.get_mut() {
-            let _ = process.kill();
-        }
 
-        // Join IO forwarding threads if they exist
-        if let Some(out_thread) = self.stdout_thread.get_mut().take() {
-            let _ = out_thread.join();
-        }
-        if let Some(err_thread) = self.stderr_thread.get_mut().take() {
-            let _ = err_thread.join();
+        if let Some(mutex) = &mut self.owned_process
+            && let Some(owned_process) = mutex.get_mut().take()
+        {
+            // Spawn a background task to kill the process asynchronously
+            // This ensures proper cleanup even when dropping outside an async context
+            tokio::task::spawn(async move {
+                if let Err(e) = kill_owned_process(owned_process).await {
+                    tracing::error!("Failed to kill emulator in Drop: {}", e);
+                }
+            });
         }
     }
 }
@@ -1244,7 +1649,7 @@ pub async fn list_avds() -> Result<Vec<String>> {
     let android_home = get_android_home().await?;
 
     tokio::task::spawn_blocking(move || {
-        let emulator_path = android_home.join("emulator").join("emulator");
+        let emulator_path = android_home.join("emulator").join(EMULATOR_BIN);
 
         if !emulator_path.exists() {
             return Err(EmulatorError::EmulatorToolNotFound(
@@ -1252,7 +1657,9 @@ pub async fn list_avds() -> Result<Vec<String>> {
             ));
         }
 
-        let output = Command::new(&emulator_path).arg("-list-avds").output()?;
+        let output = std::process::Command::new(&emulator_path)
+            .arg("-list-avds")
+            .output()?;
 
         let avds: Vec<String> = String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -1348,15 +1755,12 @@ pub async fn list_emulators() -> Result<Vec<Emulator>> {
                         && let Ok(grpc_port) = port_str.parse::<u16>()
                     {
                         emulators.push(Emulator {
-                            is_owned: false,
-                            process: tokio::sync::Mutex::new(None),
+                            owned_process: None,
                             grpc_port,
                             serial: device.identifier.clone(),
                             metadata,
                             discovery_path: discovery_path.clone(),
                             issuer: None,
-                            stdout_thread: tokio::sync::Mutex::new(None),
-                            stderr_thread: tokio::sync::Mutex::new(None),
                         });
                     }
                 }

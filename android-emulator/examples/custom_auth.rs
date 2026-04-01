@@ -9,6 +9,8 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+
     let avds = list_avds().await?;
     if avds.is_empty() {
         eprintln!(
@@ -80,9 +82,9 @@ async fn main() -> Result<()> {
         result
     );
 
-    // Terminate the emulator
-    println!("Terminating emulator...");
-    instance.terminate().await?;
+    // Kill the emulator
+    println!("Killing emulator...");
+    instance.kill().await?;
 
     Ok(())
 }

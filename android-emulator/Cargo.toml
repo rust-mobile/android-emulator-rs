@@ -5,7 +5,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/rust-mobile/android-emulator-rs"
 documentation = "https://docs.rs/android-emulator"
 readme = "README.md"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 include = ["/README.md", "/LICENSE*", "/src/**", "/proto/**", "/examples/**"]
 
@@ -15,7 +15,7 @@ tonic = "0.14"
 tonic-prost = "0.14"
 prost = "0.14"
 prost-types = "0.14"
-tokio = { version = "1", features = ["fs", "time"] }
+tokio = { version = "1", features = ["fs", "time", "process", "io-util"] }
 thiserror = "2"
 dirs = "5"
 adb_client = "3.1"
@@ -26,12 +26,34 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 
+[target.'cfg(windows)'.dependencies]
+win32job = "2"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
-serial_test = "3"
 tokio = { version = "1", features = [
     "rt",
     "rt-multi-thread",
     "time",
     "macros",
+    "process",
+    "io-util",
 ] }
 test-log = { version = "0.2", features = ["trace"] }
+console-subscriber = "0.5"
+tracing-subscriber = { version = "0.3", features = [
+    "fmt",
+    "env-filter",
+    "tracing-log",
+] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }

@@ -4,11 +4,12 @@ use android_emulator::{
     EmulatorClient, EmulatorConfig, EmulatorError, GrpcAuthConfig, get_android_home, list_avds,
     proto,
 };
-use serial_test::serial;
 use std::env;
 use std::panic;
 use std::sync::Arc;
 use std::time::Duration;
+
+static EMULATOR_SINGLETON: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Helper to get test AVD name from environment or use default
 fn get_test_avd() -> String {
@@ -58,6 +59,9 @@ async fn spawn_test_emulator_with_config<F, Fut>(
         .with_snapshot_save(false)
         .with_boot_animation(false);
 
+    // Serialize emulator tests
+    let _singleton_guard = EMULATOR_SINGLETON.lock().await;
+
     let instance = config.spawn().await.expect("Failed to start emulator");
     let instance = Arc::new(instance);
     println!("Emulator started, waiting for gRPC server...");
@@ -72,7 +76,7 @@ async fn spawn_test_emulator_with_config<F, Fut>(
             client
         }
         Err(e) => {
-            instance.terminate().await.ok();
+            instance.kill().await.ok();
             panic!("Failed to connect to gRPC server: {}", e);
         }
     };
@@ -84,9 +88,15 @@ async fn spawn_test_emulator_with_config<F, Fut>(
     // Wait for the test to complete
     let test_result = test_handle.await;
 
-    // Always terminate the emulator
-    println!("Terminating emulator...");
-    instance.terminate().await.ok();
+    // Allow a brief moment for the client connection to fully close
+    // This ensures tonic/hyper background tasks are cleaned up before terminating
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Always kill the emulator
+    println!("Killing emulator...");
+    instance.kill().await.ok();
+
+    println!("Emulator killed, checking test result...");
 
     // If the test panicked, dump the log file
     if let Err(join_error) = test_result {
@@ -107,11 +117,14 @@ async fn spawn_test_emulator_with_config<F, Fut>(
 
         // Resume the panic
         if join_error.is_panic() {
+            println!("resuming panic unwind...");
             panic::resume_unwind(join_error.into_panic());
         } else {
             // Task was cancelled, just report it
             panic!("Test task was cancelled: {}", join_error);
         }
+    } else {
+        println!("Test completed successfully");
     }
 }
 
@@ -132,8 +145,12 @@ where
 
 /// Test that we can list available AVDs
 #[tokio::test]
-#[test_log::test]
+#[cfg_attr(not(tokio_unstable), test_log::test)]
 async fn test_list_avds() {
+    #[cfg(tokio_unstable)]
+    console_subscriber::init();
+    println!("Started test_list_avds");
+
     match get_android_home().await {
         Ok(_) => {
             let avds = list_avds().await;
@@ -159,10 +176,13 @@ async fn test_list_avds() {
 
 /// Test starting an emulator and connecting via gRPC
 #[tokio::test]
-#[test_log::test]
-#[serial]
+#[cfg_attr(not(tokio_unstable), test_log::test)]
 async fn test_start_emulator_and_connect() {
+    #[cfg(tokio_unstable)]
+    console_subscriber::init();
+    println!("Started test_start_emulator_and_connect");
     spawn_test_emulator(|mut client, _emulator| async move {
+        println!("Spawned emulator for test_start_emulator_and_connect");
         println!("Connected to emulator, getting status...");
         let status = client
             .protocol_mut()
@@ -179,10 +199,13 @@ async fn test_start_emulator_and_connect() {
 
 /// Test connecting to an emulator and checking status
 #[tokio::test]
-#[test_log::test]
-#[serial]
+#[cfg_attr(not(tokio_unstable), test_log::test)]
 async fn test_connect_to_running_emulator() {
+    #[cfg(tokio_unstable)]
+    console_subscriber::init();
+    println!("Started test_connect_to_running_emulator");
     spawn_test_emulator(|mut client, _emulator| async move {
+        println!("Spawned emulator for test_connect_to_running_emulator");
         println!("Connected to running emulator");
 
         let status = client
@@ -205,14 +228,19 @@ async fn test_connect_to_running_emulator() {
         println!("Battery status: {:?}", battery);
     })
     .await;
+
+    println!("Finished test_connect_to_running_emulator");
 }
 
 /// Test getting and setting GPS coordinates
 #[tokio::test]
-#[test_log::test]
-#[serial]
+#[cfg_attr(not(tokio_unstable), test_log::test)]
 async fn test_gps_control() {
+    #[cfg(tokio_unstable)]
+    console_subscriber::init();
+    println!("Started test_gps_control");
     spawn_test_emulator(|mut client, _emulator| async move {
+        println!("Spawned emulator for test_gps_control");
         println!("Testing GPS control");
 
         // Set GPS coordinates (San Francisco)
@@ -248,10 +276,13 @@ async fn test_gps_control() {
 
 /// Test getting VM state
 #[tokio::test]
-#[test_log::test]
-#[serial]
+#[cfg_attr(not(tokio_unstable), test_log::test)]
 async fn test_vm_state() {
+    #[cfg(tokio_unstable)]
+    console_subscriber::init();
+    println!("Started test_vm_state");
     spawn_test_emulator(|mut client, _emulator| async move {
+        println!("Spawned emulator for test_vm_state");
         println!("Testing VM state");
 
         let state = client
@@ -268,10 +299,14 @@ async fn test_vm_state() {
 
 /// Test sending a touch event
 #[tokio::test]
-#[test_log::test]
-#[serial]
+#[cfg_attr(not(tokio_unstable), test_log::test)]
 async fn test_touch_event() {
+    #[cfg(tokio_unstable)]
+    console_subscriber::init();
+
     spawn_test_emulator(|mut client, _emulator| async move {
+        println!("Spawned emulator for test_touch_event");
+
         println!("Testing touch event");
 
         let touch = proto::Touch {
@@ -322,12 +357,16 @@ async fn test_touch_event() {
 
 /// Test spawning emulator with custom basic authentication
 #[tokio::test]
-#[test_log::test]
-#[serial]
+#[cfg_attr(not(tokio_unstable), test_log::test)]
 async fn test_basic_auth() {
+    #[cfg(tokio_unstable)]
+    console_subscriber::init();
+
+    println!("Started test_basic_auth");
     let avd_name = get_test_avd();
     let config = EmulatorConfig::new(avd_name).with_grpc_auth(GrpcAuthConfig::Basic);
     spawn_test_emulator_with_config(config, true, |mut client, _emulator| async move {
+        println!("Spawned emulator for test_basic_auth");
         println!("Connected to emulator with basic auth, getting status...");
         let status = client
             .protocol_mut()
@@ -343,9 +382,13 @@ async fn test_basic_auth() {
 
 /// Test spawning emulator with custom JWT authentication
 #[tokio::test]
-#[test_log::test]
-#[serial]
+#[cfg_attr(not(tokio_unstable), test_log::test)]
 async fn test_jwt_auth() {
+    #[cfg(tokio_unstable)]
+    console_subscriber::init();
+
+    println!("Started test_jwt_auth");
+
     let avd_name = get_test_avd();
 
     // Configure emulator with custom issuer
@@ -356,6 +399,8 @@ async fn test_jwt_auth() {
         .with_grpc_port(8555);
 
     spawn_test_emulator_with_config(config, false, |mut client, _emulator| async move {
+        println!("Spawned emulator for test_jwt_auth");
+
         println!("Connected to emulator with JWT auth, getting status...");
         let status = client
             .protocol_mut()
@@ -372,12 +417,18 @@ async fn test_jwt_auth() {
 
 /// Test JWT authentication with protected methods via custom allowlist
 #[tokio::test]
+//#[tokio::test(flavor = "multi_thread")]
+//#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 //#[test_log::test(default_log_filter = "trace")]
-#[test_log::test]
-#[serial]
+#[cfg_attr(not(tokio_unstable), test_log::test)]
 async fn test_jwt_auth_protected() {
     use android_emulator::auth::{AllowlistEntry, GrpcAllowlist};
     use tokio::sync::oneshot;
+
+    #[cfg(tokio_unstable)]
+    console_subscriber::init();
+
+    println!("Started test_jwt_auth_protected");
 
     let avd_name = get_test_avd();
 
@@ -407,6 +458,7 @@ async fn test_jwt_auth_protected() {
     // Spawn the emulator - the closure exports a token and waits for termination signal
     let emulator_handle = tokio::spawn(async move {
         spawn_test_emulator_with_config(config, false, move |client, _emulator| async move {
+            println!("Spawned emulator for test_jwt_auth_protected");
             println!("Emulator connected, exporting bearer token...");
 
             // Export a token with audience claims for the methods we want to test
@@ -463,9 +515,16 @@ async fn test_jwt_auth_protected() {
 
     println!("All access control tests passed!");
 
+    // Drop the client connection before terminating
+    drop(client);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
     // Signal the emulator to terminate
     terminate_tx.send(()).ok();
 
+    println!("Waiting for emulator to shut down...");
     // Wait for the emulator to shut down (this will also dump logs if there was a panic)
     emulator_handle.await.expect("Emulator handle failed");
+
+    println!("Finished test_jwt_auth_protected");
 }
